@@ -31,11 +31,13 @@ getcontext().prec = 50
 RPC_DEFAULT = "https://api.mainnet.abs.xyz/"
 DEPTHSOUL_ADDR = "0x7C0bab11b67Ac041C2Ff870ef2f7807428aE4CB2"
 CLAIM_CONTRACT = "0xd9f34CdA3667E0b5Be4b6fba55D854cFb2eD0694"
+BADGE_CONTRACT = "0xbc176ac2373614f9858a118917d83b139bcb3f8c"
 GOLDSKY_SUBGRAPH = "https://api.goldsky.com/api/public/project_cmgzljqwl006c5np2gnao4li4/subgraphs/depth-main/1.0.2/gn"
 
 # Function selectors (keccak4) used in the project
 SEL_TOKEN_ID_OF = "773c02d4"  # tokenIdOf(address)
 SEL_CLAIMABLE = "f9f87c18"     # claimable(uint256)
+SEL_ERC1155_BALANCE_OF = "00fdd58e"  # balanceOf(address,uint256)
 
 
 @dataclass
@@ -50,6 +52,13 @@ class Row:
         if self.claim_raw is None:
             return None
         return Decimal(self.claim_raw) / Decimal(10**18)
+
+
+@dataclass
+class BadgeBalanceRow:
+    label: str
+    address: str
+    balances: Dict[int, Optional[int]]
 
 
 def normalize_addresses_with_labels(text: str) -> List[tuple[str, str]]:
@@ -71,6 +80,26 @@ def normalize_addresses_with_labels(text: str) -> List[tuple[str, str]]:
         seen.add(key)
         pairs.append((label, addr))
     return pairs
+
+
+def parse_token_ids(text: str) -> List[int]:
+    values = re.split(r"[\s,，]+", text.strip()) if text.strip() else []
+    token_ids: List[int] = []
+    seen = set()
+    for value in values:
+        if not value:
+            continue
+        try:
+            token_id = int(value)
+        except ValueError as exc:
+            raise ValueError(f"无效编号: {value}") from exc
+        if token_id < 0:
+            raise ValueError(f"无效编号: {value}")
+        if token_id in seen:
+            continue
+        seen.add(token_id)
+        token_ids.append(token_id)
+    return token_ids
 
 
 def pad_hex(data_hex: str, length: int = 64) -> str:
@@ -227,6 +256,47 @@ def query_claimables(rpc_url: str, token_ids: Dict[str, Optional[int]]) -> Dict[
     return results
 
 
+def query_badge_balances(rpc_url: str, addresses: List[str], badge_ids: List[int]) -> Dict[str, Dict[int, Optional[int]]]:
+    results: Dict[str, Dict[int, Optional[int]]] = {
+        addr: {badge_id: None for badge_id in badge_ids}
+        for addr in addresses
+    }
+    batch = []
+    id_map: Dict[int, tuple[str, int]] = {}
+    req_id = 1001
+
+    for addr in addresses:
+        encoded_addr = pad_hex(addr.lower().replace("0x", ""))
+        for badge_id in badge_ids:
+            data = "0x" + SEL_ERC1155_BALANCE_OF + encoded_addr + pad_hex(hex(badge_id).replace("0x", ""))
+            batch.append(build_call(BADGE_CONTRACT, data, req_id))
+            id_map[req_id] = (addr, badge_id)
+            req_id += 1
+
+    if not batch:
+        return results
+
+    chunk_size = 20
+    resp_by_id: Dict[int, Dict] = {}
+    for start in range(0, len(batch), chunk_size):
+        chunk = batch[start : start + chunk_size]
+        resp = post_batch(rpc_url, chunk)
+        for item in resp:
+            if isinstance(item, dict) and "id" in item:
+                resp_by_id[item["id"]] = item
+        time.sleep(0.2)
+
+    for call_id, (addr, badge_id) in id_map.items():
+        item = resp_by_id.get(call_id)
+        if not item or "result" not in item:
+            continue
+        try:
+            results[addr][badge_id] = decode_uint256(item.get("result", "0x0"))
+        except Exception:
+            results[addr][badge_id] = None
+    return results
+
+
 def build_csv(rows: List[Row]) -> bytes:
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -241,19 +311,30 @@ def build_csv(rows: List[Row]) -> bytes:
     return buf.getvalue().encode()
 
 
-def main() -> None:
-    st.set_page_config(page_title="DEPTH Claimable Checker", page_icon="🌊", layout="centered")
-    st.title("DEPTH Claimable Checker")
+def build_badge_csv(rows: List[BadgeBalanceRow], badge_ids: List[int]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(["label", "address", *[f"badge_{badge_id}" for badge_id in badge_ids]])
+    for r in rows:
+        writer.writerow([
+            r.label,
+            r.address,
+            *[("" if r.balances.get(badge_id) is None else r.balances.get(badge_id)) for badge_id in badge_ids],
+        ])
+    return buf.getvalue().encode()
 
-    rpc_url = st.text_input("RPC Endpoint", value=RPC_DEFAULT)
-    use_subgraph = st.checkbox("子图补全 tokenId（Goldsky）", value=True, help="当直接 RPC 查询不到 tokenId 时，尝试从 Goldsky 子图读取最新 vault id。")
+
+def render_depth_claimable_page() -> None:
+    rpc_url = st.text_input("RPC Endpoint", value=RPC_DEFAULT, key="depth_rpc")
+    use_subgraph = st.checkbox("子图补全 tokenId（Goldsky）", value=True, help="当直接 RPC 查询不到 tokenId 时，尝试从 Goldsky 子图读取最新 vault id。", key="depth_use_subgraph")
     addr_text = st.text_area(
         "地址列表（可含标签，如 MOD1.LNK 0x...）",
         height=260,
         placeholder="MOD1.LNK\t0x...\nMOD2.LNK 0x...",
+        key="depth_addr_text",
     )
 
-    if st.button("查询可领取"):
+    if st.button("查询可领取", key="depth_query_btn"):
         pairs = normalize_addresses_with_labels(addr_text)
         if not pairs:
             st.warning("未识别到有效地址")
@@ -322,9 +403,92 @@ def main() -> None:
             data=csv_bytes,
             file_name="claimable_depth.csv",
             mime="text/csv",
+            key="depth_download_btn",
         )
 
         st.caption("数据单位：DEPTH，精度 18 位小数")
+
+
+def render_badge_query_page() -> None:
+    rpc_url = st.text_input("RPC Endpoint", value=RPC_DEFAULT, key="badge_rpc")
+    addr_text = st.text_area(
+        "钱包列表（可含编号/标签，如 001 0x...）",
+        height=260,
+        placeholder="001 0x...\n002 0x...",
+        key="badge_addr_text",
+    )
+    badge_ids_text = st.text_input(
+        "Badge 编号（整体输入，支持空格/逗号分隔）",
+        placeholder="1 2 3",
+        key="badge_ids_text",
+    )
+
+    if st.button("查询 Badge", key="badge_query_btn"):
+        pairs = normalize_addresses_with_labels(addr_text)
+        if not pairs:
+            st.warning("未识别到有效地址")
+            return
+
+        try:
+            badge_ids = parse_token_ids(badge_ids_text)
+        except ValueError as exc:
+            st.warning(str(exc))
+            return
+
+        if not badge_ids:
+            st.warning("请先输入至少一个 Badge 编号")
+            return
+
+        addresses = [addr for _, addr in pairs]
+        balances = query_badge_balances(rpc_url, addresses, badge_ids)
+        rows = [
+            BadgeBalanceRow(label=label, address=addr, balances=balances.get(addr, {}))
+            for label, addr in pairs
+        ]
+
+        table_data = [
+            {
+                "label": r.label,
+                "address": r.address,
+                **{f"badge_{badge_id}": r.balances.get(badge_id) for badge_id in badge_ids},
+            }
+            for r in rows
+        ]
+        st.dataframe(table_data, use_container_width=True)
+
+        total_nonzero = sum(
+            1
+            for r in rows
+            if any((r.balances.get(badge_id) or 0) > 0 for badge_id in badge_ids)
+        )
+        st.caption(f"共查询 {len(rows)} 个钱包，{len(badge_ids)} 个 Badge 编号；其中 {total_nonzero} 个钱包至少持有一个 Badge。")
+
+        csv_bytes = build_badge_csv(rows, badge_ids)
+        st.download_button(
+            "下载 CSV",
+            data=csv_bytes,
+            file_name="badge_balances.csv",
+            mime="text/csv",
+            key="badge_download_btn",
+        )
+
+
+def render_claimable_page() -> None:
+    st.header("Claimable 查询")
+    tab_depth, tab_badge = st.tabs(["Depth", "Badge"])
+
+    with tab_depth:
+        render_depth_claimable_page()
+
+    with tab_badge:
+        render_badge_query_page()
+
+
+def main() -> None:
+    st.set_page_config(page_title="ABS Claimable Checker", page_icon="🌊", layout="wide")
+    st.title("ABS Claimable Checker")
+    st.caption("单文件部署版：支持 DEPTH claimable 查询和 Badge ERC1155 持仓查询。")
+    render_claimable_page()
 
 
 if __name__ == "__main__":
